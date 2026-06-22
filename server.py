@@ -1052,6 +1052,162 @@ async def shopify_delete_theme_asset(params: DeleteThemeAssetInput) -> str:
         return _error(e)
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+# MEDIA (product images) + SEO
+# ═══════════════════════════════════════════════════════════════════════════
+
+async def _graphql(query: str, variables: Optional[dict] = None, _retried: bool = False) -> dict:
+    """GraphQL helper — mirrors _request's 401-refresh behaviour.
+    Used for staged uploads and product media, which have no REST equivalent.
+    """
+    if not SHOPIFY_STORE:
+        raise RuntimeError("Missing SHOPIFY_STORE environment variable.")
+
+    url     = f"https://{SHOPIFY_STORE}.myshopify.com/admin/api/{API_VERSION}/graphql.json"
+    headers = await _headers()
+
+    async with httpx.AsyncClient() as client:
+        resp = await client.post(
+            url,
+            headers=headers,
+            json={"query": query, "variables": variables or {}},
+            timeout=60.0,
+        )
+
+        if resp.status_code == 401 and not _retried and token_manager._use_client_credentials:
+            logger.warning("GraphQL got 401 — refreshing token and retrying...")
+            await token_manager.force_refresh()
+            return await _graphql(query, variables, _retried=True)
+
+        resp.raise_for_status()
+        payload = resp.json()
+        if payload.get("errors"):
+            raise RuntimeError(f"GraphQL error: {json.dumps(payload['errors'])[:500]}")
+        return payload.get("data", {})
+
+
+class StageImageUploadInput(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+    filename:  str           = Field(..., min_length=1, description="File name, e.g. 'yhl-swag-frente.jpg' (used for SEO)")
+    mime_type: str           = Field(..., description="MIME type, e.g. 'image/jpeg', 'image/webp', 'image/png'")
+    file_size: str           = Field(..., description="File size in bytes, as a string, e.g. '348201'")
+    resource:  Optional[str] = Field(default="PRODUCT_IMAGE", description="Staged resource type: PRODUCT_IMAGE (default) or FILE")
+
+
+@mcp.tool(
+    name="shopify_stage_image_upload",
+    annotations={"readOnlyHint": False, "destructiveHint": False, "idempotentHint": False, "openWorldHint": True},
+)
+async def shopify_stage_image_upload(params: StageImageUploadInput) -> str:
+    """Step 1 of uploading a LOCAL image. Creates a staged upload target and returns a pre-signed
+    'url' + 'parameters' to POST the raw file bytes to (done from the local machine — no token needed),
+    plus a 'resourceUrl' to pass to shopify_attach_product_media afterwards."""
+    try:
+        query = (
+            "mutation stage($input:[StagedUploadInput!]!){"
+            " stagedUploadsCreate(input:$input){"
+            " stagedTargets{ url resourceUrl parameters{ name value } }"
+            " userErrors{ field message } } }"
+        )
+        variables = {"input": [{
+            "filename":   params.filename,
+            "mimeType":   params.mime_type,
+            "resource":   params.resource,
+            "fileSize":   params.file_size,
+            "httpMethod": "POST",
+        }]}
+        data   = await _graphql(query, variables)
+        result = data.get("stagedUploadsCreate", {})
+        errs   = result.get("userErrors") or []
+        if errs:
+            return _fmt({"userErrors": errs})
+        return _fmt({"stagedTargets": result.get("stagedTargets", [])})
+    except Exception as e:
+        return _error(e)
+
+
+class AttachProductMediaInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    product_id: int = Field(..., description="Product ID to attach media to")
+    sources: List[Dict[str, Any]] = Field(
+        ...,
+        description="List of media to attach. Each item: {original_source: <public image URL or staged resourceUrl>, alt: <optional alt text>}",
+    )
+
+
+@mcp.tool(
+    name="shopify_attach_product_media",
+    annotations={"readOnlyHint": False, "destructiveHint": False, "idempotentHint": False, "openWorldHint": True},
+)
+async def shopify_attach_product_media(params: AttachProductMediaInput) -> str:
+    """Step 2: attach one or more images to a product. Each 'original_source' can be a public image URL
+    OR a 'resourceUrl' returned by shopify_stage_image_upload. Sets alt text for SEO/accessibility."""
+    try:
+        media: List[Dict[str, Any]] = []
+        for s in params.sources:
+            src = s.get("original_source") or s.get("originalSource")
+            if not src:
+                return _fmt({"error": "each source needs 'original_source'"})
+            item: Dict[str, Any] = {"mediaContentType": "IMAGE", "originalSource": src}
+            if s.get("alt"):
+                item["alt"] = s["alt"]
+            media.append(item)
+
+        query = (
+            "mutation attach($productId:ID!,$media:[CreateMediaInput!]!){"
+            " productCreateMedia(productId:$productId, media:$media){"
+            " media{ ... on MediaImage { id alt status image{ url } } }"
+            " mediaUserErrors{ field message } } }"
+        )
+        variables = {"productId": f"gid://shopify/Product/{params.product_id}", "media": media}
+        data = await _graphql(query, variables)
+        return _fmt(data.get("productCreateMedia", data))
+    except Exception as e:
+        return _error(e)
+
+
+class SetProductSeoInput(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+    product_id:      int           = Field(..., description="Product ID")
+    seo_title:       Optional[str] = Field(default=None, description="Meta title (global.title_tag) shown in search results")
+    seo_description: Optional[str] = Field(default=None, description="Meta description (global.description_tag) shown in search results")
+
+
+@mcp.tool(
+    name="shopify_set_product_seo",
+    annotations={"readOnlyHint": False, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True},
+)
+async def shopify_set_product_seo(params: SetProductSeoInput) -> str:
+    """Set a product's SEO meta title and/or description (the snippet shown on Google).
+    Upserts the global.title_tag / global.description_tag metafields."""
+    try:
+        if params.seo_title is None and params.seo_description is None:
+            return "Error: provide seo_title and/or seo_description."
+
+        existing = await _request("GET", f"products/{params.product_id}/metafields.json", params={"namespace": "global"})
+        metas    = {m["key"]: m for m in existing.get("metafields", [])}
+
+        targets = []
+        if params.seo_title is not None:
+            targets.append(("title_tag", params.seo_title, "single_line_text_field"))
+        if params.seo_description is not None:
+            targets.append(("description_tag", params.seo_description, "multi_line_text_field"))
+
+        results = []
+        for key, value, mtype in targets:
+            if key in metas:
+                mid  = metas[key]["id"]
+                data = await _request("PUT", f"metafields/{mid}.json",
+                                      body={"metafield": {"id": mid, "value": value, "type": mtype}})
+            else:
+                data = await _request("POST", f"products/{params.product_id}/metafields.json",
+                                      body={"metafield": {"namespace": "global", "key": key, "value": value, "type": mtype}})
+            results.append(data.get("metafield", data))
+        return _fmt({"updated": results})
+    except Exception as e:
+        return _error(e)
+
+
 # ---------------------------------------------------------------------------
 # Entrypoint
 # ---------------------------------------------------------------------------
