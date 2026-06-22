@@ -1208,6 +1208,110 @@ async def shopify_set_product_seo(params: SetProductSeoInput) -> str:
         return _error(e)
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+# METAFIELDS · FILES · VARIANT MEDIA   (added jun 2026 — product setup, both stores)
+# ═══════════════════════════════════════════════════════════════════════════
+
+class SetProductMetafieldInput(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+    product_id: int = Field(..., description="Product ID that owns the metafield")
+    namespace:  str = Field(..., description="Metafield namespace, e.g. 'custom'")
+    key:        str = Field(..., description="Metafield key, e.g. 'guia_cuidados'")
+    type:       str = Field(..., description="Metafield type: e.g. 'multi_line_text_field', 'single_line_text_field', 'file_reference'")
+    value:      str = Field(..., description="Value. For file_reference pass the file GID (gid://shopify/MediaImage/...)")
+
+
+@mcp.tool(
+    name="shopify_set_product_metafield",
+    annotations={"readOnlyHint": False, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True},
+)
+async def shopify_set_product_metafield(params: SetProductMetafieldInput) -> str:
+    """Upsert ANY product metafield (namespace/key/type/value) via GraphQL metafieldsSet.
+    E.g. custom.guia_cuidados (multi_line_text_field) or custom.guia_tallas (file_reference → file GID)."""
+    try:
+        query = (
+            "mutation setMeta($metafields:[MetafieldsSetInput!]!){"
+            " metafieldsSet(metafields:$metafields){"
+            " metafields{ id namespace key type value }"
+            " userErrors{ field message } } }"
+        )
+        variables = {"metafields": [{
+            "ownerId":   f"gid://shopify/Product/{params.product_id}",
+            "namespace": params.namespace,
+            "key":       params.key,
+            "type":      params.type,
+            "value":     params.value,
+        }]}
+        data = await _graphql(query, variables)
+        return _fmt(data.get("metafieldsSet", data))
+    except Exception as e:
+        return _error(e)
+
+
+class CreateFileInput(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+    original_source: str           = Field(..., description="Public image URL or a staged resourceUrl (resource=FILE) to import into Shopify Files")
+    alt:             Optional[str] = Field(default=None, description="Alt text for the file")
+    content_type:    Optional[str] = Field(default="IMAGE", description="File content type: IMAGE (default), FILE or VIDEO")
+
+
+@mcp.tool(
+    name="shopify_create_file",
+    annotations={"readOnlyHint": False, "destructiveHint": False, "idempotentHint": False, "openWorldHint": True},
+)
+async def shopify_create_file(params: CreateFileInput) -> str:
+    """Import a file into Shopify *Files* (fileCreate) and return its GID — use that GID as the value of a
+    file_reference metafield (e.g. custom.guia_tallas). For local files: stage with resource=FILE, POST the
+    bytes, then pass the resourceUrl here."""
+    try:
+        f: Dict[str, Any] = {"originalSource": params.original_source, "contentType": params.content_type or "IMAGE"}
+        if params.alt:
+            f["alt"] = params.alt
+        query = (
+            "mutation createFile($files:[FileCreateInput!]!){"
+            " fileCreate(files:$files){"
+            " files{ id fileStatus alt ... on MediaImage { image{ url } } }"
+            " userErrors{ field message } } }"
+        )
+        data = await _graphql(query, {"files": [f]})
+        return _fmt(data.get("fileCreate", data))
+    except Exception as e:
+        return _error(e)
+
+
+class SetVariantImageInput(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+    product_id: int = Field(..., description="Product ID that owns the variant and the media")
+    variant_id: int = Field(..., description="Variant ID to set the image on")
+    media_id:   str = Field(..., description="Media GID to assign (gid://shopify/MediaImage/...), already attached to the product")
+
+
+@mcp.tool(
+    name="shopify_set_variant_image",
+    annotations={"readOnlyHint": False, "destructiveHint": False, "idempotentHint": False, "openWorldHint": True},
+)
+async def shopify_set_variant_image(params: SetVariantImageInput) -> str:
+    """Assign a product media image to a specific variant (productVariantAppendMedia). The media must already
+    be attached to the product (shopify_attach_product_media returns the media ids you pass here)."""
+    try:
+        query = (
+            "mutation appendMedia($productId:ID!,$variantMedia:[ProductVariantAppendMediaInput!]!){"
+            " productVariantAppendMedia(productId:$productId, variantMedia:$variantMedia){"
+            " productVariants{ id } userErrors{ field message } } }"
+        )
+        variables = {
+            "productId": f"gid://shopify/Product/{params.product_id}",
+            "variantMedia": [{
+                "variantId": f"gid://shopify/ProductVariant/{params.variant_id}",
+                "mediaIds":  [params.media_id],
+            }],
+        }
+        data = await _graphql(query, variables)
+        return _fmt(data.get("productVariantAppendMedia", data))
+    except Exception as e:
+        return _error(e)
+
+
 # ---------------------------------------------------------------------------
 # Entrypoint
 # ---------------------------------------------------------------------------
