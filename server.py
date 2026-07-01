@@ -1312,6 +1312,118 @@ async def shopify_set_variant_image(params: SetVariantImageInput) -> str:
         return _error(e)
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+# METAFIELD DEFINITIONS (storefront filters — added jul 2026)
+# ═══════════════════════════════════════════════════════════════════════════
+
+class GetMetafieldDefinitionsInput(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+    owner_type: Optional[str] = Field(default="PRODUCT", description="Owner type: PRODUCT, VARIANT, COLLECTION, etc.")
+    namespace:  Optional[str] = Field(default=None, description="Filter by namespace, e.g. 'custom'")
+
+
+@mcp.tool(
+    name="shopify_get_metafield_definitions",
+    annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True},
+)
+async def shopify_get_metafield_definitions(params: GetMetafieldDefinitionsInput) -> str:
+    """List metafield DEFINITIONS for an owner type (default PRODUCT), optionally filtered by namespace.
+    Shows id/name/key/type and whether each already has the 'filterable' capability (storefront filter)
+    enabled. Check this before shopify_set_metafield_definition to see what already exists."""
+    try:
+        query = (
+            "query defs($ownerType:MetafieldOwnerType!,$namespace:String){"
+            " metafieldDefinitions(first:100, ownerType:$ownerType, namespace:$namespace){"
+            " nodes{ id name namespace key type{ name } "
+            " validations{ name value } capabilities{ filterable{ enabled } } } } }"
+        )
+        variables = {"ownerType": params.owner_type, "namespace": params.namespace}
+        data = await _graphql(query, variables)
+        return _fmt(data.get("metafieldDefinitions", data))
+    except Exception as e:
+        return _error(e)
+
+
+class SetMetafieldDefinitionInput(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+    namespace:  str                 = Field(..., description="Metafield namespace, e.g. 'custom'")
+    key:        str                 = Field(..., description="Metafield key, e.g. 'genero'")
+    name:       str                 = Field(..., description="Human-readable name shown in admin, e.g. 'Género'")
+    type:       str                 = Field(default="single_line_text_field", description="Metafield type, e.g. 'single_line_text_field'")
+    owner_type: Optional[str]       = Field(default="PRODUCT", description="Owner type: PRODUCT, VARIANT, COLLECTION, etc.")
+    choices:    Optional[List[str]] = Field(default=None, description="Optional fixed list of allowed values (dropdown, keeps filter values consistent), e.g. ['Hombre','Mujer','Unisex']")
+
+
+@mcp.tool(
+    name="shopify_set_metafield_definition",
+    annotations={"readOnlyHint": False, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True},
+)
+async def shopify_set_metafield_definition(params: SetMetafieldDefinitionInput) -> str:
+    """Create (or update) a metafield DEFINITION with the 'filterable' capability enabled, so it can show up
+    as a storefront filter in Search & Discovery. NOTE: Shopify still requires a one-time manual toggle in
+    Admin > Settings > Search & discovery > Filters to switch it visibly ON for shoppers the first time —
+    this tool only prepares the definition (create-or-update, idempotent). Pass `choices` for a fixed
+    dropdown of values (recommended for filters, e.g. Género: Hombre/Mujer/Unisex)."""
+    try:
+        validations = []
+        if params.choices:
+            validations.append({"name": "choices", "value": json.dumps(params.choices)})
+
+        definition_input = {
+            "name": params.name,
+            "namespace": params.namespace,
+            "key": params.key,
+            "type": params.type,
+            "ownerType": params.owner_type,
+            "capabilities": {"filterable": {"enabled": True}},
+        }
+        if validations:
+            definition_input["validations"] = validations
+
+        create_query = (
+            "mutation createDef($definition:MetafieldDefinitionInput!){"
+            " metafieldDefinitionCreate(definition:$definition){"
+            " createdDefinition{ id name } userErrors{ field message code } } }"
+        )
+        data = await _graphql(create_query, {"definition": definition_input})
+        result = data.get("metafieldDefinitionCreate", {})
+        errors = result.get("userErrors") or []
+
+        if not any(e.get("code") == "TAKEN" for e in errors):
+            return _fmt(result)
+
+        # Ya existe -> buscar su id y activarle/actualizarle la capacidad filterable
+        lookup_query = (
+            "query defs($ownerType:MetafieldOwnerType!,$namespace:String,$key:String!){"
+            " metafieldDefinitions(first:1, ownerType:$ownerType, namespace:$namespace, key:$key){"
+            " nodes{ id } } }"
+        )
+        lookup = await _graphql(lookup_query, {
+            "ownerType": params.owner_type, "namespace": params.namespace, "key": params.key,
+        })
+        nodes = (lookup.get("metafieldDefinitions") or {}).get("nodes") or []
+        if not nodes:
+            return _fmt({"createErrors": errors})
+
+        update_input = {
+            "id": nodes[0]["id"],
+            "name": params.name,
+            "capabilities": {"filterable": {"enabled": True}},
+        }
+        if validations:
+            update_input["validations"] = validations
+
+        update_query = (
+            "mutation updateDef($definition:MetafieldDefinitionUpdateInput!){"
+            " metafieldDefinitionUpdate(definition:$definition){"
+            " updatedDefinition{ id name } userErrors{ field message code } } }"
+        )
+        update_data = await _graphql(update_query, {"definition": update_input})
+        return _fmt(update_data.get("metafieldDefinitionUpdate", update_data))
+    except Exception as e:
+        return _error(e)
+
+
 # ---------------------------------------------------------------------------
 # Entrypoint
 # ---------------------------------------------------------------------------
