@@ -1313,6 +1313,34 @@ async def shopify_set_variant_image(params: SetVariantImageInput) -> str:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+# RAW GRAPHQL (read-only escape hatch — added jul 2026, for schema introspection
+# and anything without a dedicated tool yet)
+# ═══════════════════════════════════════════════════════════════════════════
+
+class GraphqlQueryInput(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+    query:     str            = Field(..., description="A GraphQL QUERY (read-only) — introspection or any `query { ... }`")
+    variables: Optional[dict] = Field(default=None, description="Optional GraphQL variables")
+
+
+@mcp.tool(
+    name="shopify_graphql_query",
+    annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True},
+)
+async def shopify_graphql_query(params: GraphqlQueryInput) -> str:
+    """Run an arbitrary READ-ONLY GraphQL query against the Admin API (e.g. `{ __type(name:"Foo"){ name fields { name } } }`).
+    Use this to check exact field/input names before adding a dedicated tool, or for reads with no tool yet.
+    Does not accept mutations — use a dedicated write tool, or ask for one to be added."""
+    try:
+        if "mutation" in params.query.lower().split("(")[0].split("{")[0]:
+            return _error(RuntimeError("shopify_graphql_query is read-only — mutations aren't allowed here."))
+        data = await _graphql(params.query, params.variables)
+        return _fmt(data)
+    except Exception as e:
+        return _error(e)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 # METAFIELD DEFINITIONS (storefront filters — added jul 2026)
 # ═══════════════════════════════════════════════════════════════════════════
 
