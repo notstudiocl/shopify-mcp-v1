@@ -1356,14 +1356,14 @@ class GetMetafieldDefinitionsInput(BaseModel):
 )
 async def shopify_get_metafield_definitions(params: GetMetafieldDefinitionsInput) -> str:
     """List metafield DEFINITIONS for an owner type (default PRODUCT), optionally filtered by namespace.
-    Shows id/name/key/type and whether each already has the 'filterable' capability (storefront filter)
-    enabled. Check this before shopify_set_metafield_definition to see what already exists."""
+    Shows id/name/key/type/validations. Check this before shopify_set_metafield_definition to see what
+    already exists."""
     try:
         query = (
             "query defs($ownerType:MetafieldOwnerType!,$namespace:String){"
             " metafieldDefinitions(first:100, ownerType:$ownerType, namespace:$namespace){"
             " nodes{ id name namespace key type{ name } "
-            " validations{ name value } capabilities{ filterable{ enabled } } } } }"
+            " validations{ name value } capabilities{ adminFilterable{ enabled } } } } }"
         )
         variables = {"ownerType": params.owner_type, "namespace": params.namespace}
         data = await _graphql(query, variables)
@@ -1379,7 +1379,7 @@ class SetMetafieldDefinitionInput(BaseModel):
     name:       str                 = Field(..., description="Human-readable name shown in admin, e.g. 'Género'")
     type:       str                 = Field(default="single_line_text_field", description="Metafield type, e.g. 'single_line_text_field'")
     owner_type: Optional[str]       = Field(default="PRODUCT", description="Owner type: PRODUCT, VARIANT, COLLECTION, etc.")
-    choices:    Optional[List[str]] = Field(default=None, description="Optional fixed list of allowed values (dropdown, keeps filter values consistent), e.g. ['Hombre','Mujer','Unisex']")
+    choices:    Optional[List[str]] = Field(default=None, description="Optional fixed list of allowed values (dropdown, keeps values consistent), e.g. ['Hombre','Mujer','Unisex']")
 
 
 @mcp.tool(
@@ -1387,11 +1387,12 @@ class SetMetafieldDefinitionInput(BaseModel):
     annotations={"readOnlyHint": False, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True},
 )
 async def shopify_set_metafield_definition(params: SetMetafieldDefinitionInput) -> str:
-    """Create (or update) a metafield DEFINITION with the 'filterable' capability enabled, so it can show up
-    as a storefront filter in Search & Discovery. NOTE: Shopify still requires a one-time manual toggle in
-    Admin > Settings > Search & discovery > Filters to switch it visibly ON for shoppers the first time —
-    this tool only prepares the definition (create-or-update, idempotent). Pass `choices` for a fixed
-    dropdown of values (recommended for filters, e.g. Género: Hombre/Mujer/Unisex)."""
+    """Create (or update, idempotent) a metafield DEFINITION with admin-filterable capability enabled.
+    Pass `choices` for a fixed dropdown of values (recommended, e.g. Género: Hombre/Mujer/Unisex).
+    IMPORTANT: this makes the metafield ELIGIBLE to become a storefront collection filter, but does NOT
+    turn it on for shoppers by itself — there is no public Admin API for that step. After running this
+    (and setting values on products with shopify_set_product_metafield), a human must go to Shopify Admin
+    > Settings > Search & discovery > Filters > Add filter > pick this metafield > Save, once."""
     try:
         validations = []
         if params.choices:
@@ -1403,7 +1404,7 @@ async def shopify_set_metafield_definition(params: SetMetafieldDefinitionInput) 
             "key": params.key,
             "type": params.type,
             "ownerType": params.owner_type,
-            "capabilities": {"filterable": {"enabled": True}},
+            "capabilities": {"adminFilterable": {"enabled": True}},
         }
         if validations:
             definition_input["validations"] = validations
@@ -1420,7 +1421,7 @@ async def shopify_set_metafield_definition(params: SetMetafieldDefinitionInput) 
         if not any(e.get("code") == "TAKEN" for e in errors):
             return _fmt(result)
 
-        # Ya existe -> buscar su id y activarle/actualizarle la capacidad filterable
+        # Ya existe -> buscar su id y actualizarle nombre/validations/capacidad
         lookup_query = (
             "query defs($ownerType:MetafieldOwnerType!,$namespace:String,$key:String!){"
             " metafieldDefinitions(first:1, ownerType:$ownerType, namespace:$namespace, key:$key){"
@@ -1436,7 +1437,7 @@ async def shopify_set_metafield_definition(params: SetMetafieldDefinitionInput) 
         update_input = {
             "id": nodes[0]["id"],
             "name": params.name,
-            "capabilities": {"filterable": {"enabled": True}},
+            "capabilities": {"adminFilterable": {"enabled": True}},
         }
         if validations:
             update_input["validations"] = validations
