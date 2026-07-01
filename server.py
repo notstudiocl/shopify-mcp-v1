@@ -1421,21 +1421,11 @@ async def shopify_set_metafield_definition(params: SetMetafieldDefinitionInput) 
         if not any(e.get("code") == "TAKEN" for e in errors):
             return _fmt(result)
 
-        # Ya existe -> buscar su id y actualizarle nombre/validations/capacidad
-        lookup_query = (
-            "query defs($ownerType:MetafieldOwnerType!,$namespace:String,$key:String!){"
-            " metafieldDefinitions(first:1, ownerType:$ownerType, namespace:$namespace, key:$key){"
-            " nodes{ id } } }"
-        )
-        lookup = await _graphql(lookup_query, {
-            "ownerType": params.owner_type, "namespace": params.namespace, "key": params.key,
-        })
-        nodes = (lookup.get("metafieldDefinitions") or {}).get("nodes") or []
-        if not nodes:
-            return _fmt({"createErrors": errors})
-
+        # Ya existe -> actualizarla (se identifica por namespace+key+ownerType, no por id)
         update_input = {
-            "id": nodes[0]["id"],
+            "namespace": params.namespace,
+            "key": params.key,
+            "ownerType": params.owner_type,
             "name": params.name,
             "capabilities": {"adminFilterable": {"enabled": True}},
         }
