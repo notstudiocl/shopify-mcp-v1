@@ -1312,6 +1312,38 @@ async def shopify_set_variant_image(params: SetVariantImageInput) -> str:
         return _error(e)
 
 
+class SetProductCategoryInput(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+    product_id:  int = Field(..., description="Product to categorize")
+    category_id: str = Field(..., description="Shopify standard taxonomy category GID, e.g. "
+                                               "'gid://shopify/TaxonomyCategory/aa-1-13-13' (Hoodies). "
+                                               "Look one up first via shopify_graphql_query: "
+                                               "`{ taxonomy { categories(search:\"hoodie\", first:5) { edges { node { id fullName } } } } } `.")
+
+
+@mcp.tool(
+    name="shopify_set_product_category",
+    annotations={"readOnlyHint": False, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True},
+)
+async def shopify_set_product_category(params: SetProductCategoryInput) -> str:
+    """Set a product's standard Shopify taxonomy category (productUpdate). Needed before
+    shopify_set_product_color_swatches will work on products created without a category — Shopify
+    rejects linking the shopify.color-pattern metafield on options with no category context, with the
+    unhelpful error 'At least one value ... is invalid'."""
+    try:
+        data = await _graphql(
+            "mutation setCat($input:ProductInput!){ productUpdate(input:$input){ userErrors{ field message } } }",
+            {"input": {"id": f"gid://shopify/Product/{params.product_id}", "category": params.category_id}},
+        )
+        result = data.get("productUpdate", {})
+        errs = result.get("userErrors") or []
+        if errs:
+            return _fmt({"userErrors": errs})
+        return _fmt({"ok": True})
+    except Exception as e:
+        return _error(e)
+
+
 class ColorSwatchValue(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
     name: str = Field(..., description="Exact text of the option value on the product, e.g. 'Rojo' — must match exactly")
