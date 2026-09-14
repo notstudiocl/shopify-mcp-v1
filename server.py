@@ -1312,6 +1312,127 @@ async def shopify_set_variant_image(params: SetVariantImageInput) -> str:
         return _error(e)
 
 
+class ColorSwatchValue(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+    name: str = Field(..., description="Exact text of the option value on the product, e.g. 'Rojo' — must match exactly")
+    hex: Optional[str] = Field(
+        default=None,
+        description="Hex color e.g. '#C8102E'. Required the first time this color name is used in the shop "
+                    "(creates a reusable 'Color' metaobject entry); omit to reuse an existing entry with that name.",
+    )
+    base_color_taxonomy_id: Optional[int] = Field(
+        default=None,
+        description="Numeric id of Shopify's standard color taxonomy value (e.g. 13=Red, 15=Navy, 8=Gray, 2=Blue, "
+                     "1=Black, 3=White). Required together with 'hex' when creating a new color entry. Look up "
+                     "other ids via shopify_graphql_query: `node(id:\"gid://shopify/TaxonomyValue/<n>\"){ ... on TaxonomyValue{ name } }`.",
+    )
+
+
+class SetProductColorSwatchesInput(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+    product_id:  int                     = Field(..., description="Product ID that owns the Color option")
+    option_name: Optional[str]           = Field(default="Color", description="Name of the option to link (default 'Color')")
+    values:      List[ColorSwatchValue]  = Field(..., description="Option values to assign a real color swatch to")
+
+
+@mcp.tool(
+    name="shopify_set_product_color_swatches",
+    annotations={"readOnlyHint": False, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True},
+)
+async def shopify_set_product_color_swatches(params: SetProductColorSwatchesInput) -> str:
+    """Make a product's Color option render as real color swatches (square/round, per the theme's setting)
+    instead of a plain text dropdown. Shopify swatches work by linking each option VALUE to a shared 'Color'
+    metaobject entry (namespace 'shopify', key 'color-pattern') that carries the actual color.
+
+    For each value: reuses an existing metaobject entry with that exact name if one exists in the shop
+    (shared across all products — e.g. 'Negro' only needs to be created once, ever), otherwise creates one
+    from 'hex' + 'base_color_taxonomy_id'. Then links the product's option to shopify.color-pattern and sets
+    each value's linkedMetafieldValue. Safe to re-run (idempotent) — re-linking an already-linked option/value
+    is a no-op.
+    """
+    try:
+        product_gid = f"gid://shopify/Product/{params.product_id}"
+
+        data = await _graphql(
+            "query getOpt($id:ID!){ product(id:$id){ options(first:10){ id name "
+            " optionValues{ id name } } } }",
+            {"id": product_gid},
+        )
+        options = ((data.get("product") or {}).get("options")) or []
+        option = next((o for o in options if o["name"].lower() == params.option_name.lower()), None)
+        if not option:
+            return _fmt({"error": f"No option named '{params.option_name}' on product {params.product_id}",
+                         "available_options": [o["name"] for o in options]})
+
+        value_by_name = {v["name"]: v["id"] for v in option["optionValues"]}
+
+        optionValuesToUpdate: List[Dict[str, Any]] = []
+        created_entries: List[str] = []
+        reused_entries:  List[str] = []
+
+        for v in params.values:
+            option_value_id = value_by_name.get(v.name)
+            if not option_value_id:
+                return _fmt({"error": f"No option value named '{v.name}' on this product's '{params.option_name}' option",
+                             "available_values": list(value_by_name.keys())})
+
+            handle = "".join(c if c.isalnum() else "-" for c in v.name.lower()).strip("-")
+            lookup = await _graphql(
+                "query byHandle($handle:MetaobjectHandleInput!){ metaobjectByHandle(handle:$handle){ id } }",
+                {"handle": {"type": "shopify--color-pattern", "handle": handle}},
+            )
+            metaobject = (lookup.get("metaobjectByHandle") or {}).get("id")
+
+            if metaobject:
+                reused_entries.append(v.name)
+            else:
+                if not v.hex or not v.base_color_taxonomy_id:
+                    return _fmt({"error": f"Color '{v.name}' doesn't exist yet in this shop — 'hex' and "
+                                           f"'base_color_taxonomy_id' are required to create it."})
+                create = await _graphql(
+                    "mutation createColor($handle:String!,$fields:[MetaobjectFieldInput!]!){"
+                    " metaobjectCreate(metaobject:{type:\"shopify--color-pattern\", handle:$handle, fields:$fields}){"
+                    " metaobject{ id } userErrors{ field message } } }",
+                    {
+                        "handle": handle,
+                        "fields": [
+                            {"key": "label", "value": v.name},
+                            {"key": "color", "value": v.hex},
+                            {"key": "color_taxonomy_reference",
+                             "value": json.dumps([f"gid://shopify/TaxonomyValue/{v.base_color_taxonomy_id}"])},
+                            {"key": "pattern_taxonomy_reference", "value": "gid://shopify/TaxonomyValue/2874"},
+                        ],
+                    },
+                )
+                result = create.get("metaobjectCreate", {})
+                errs = result.get("userErrors") or []
+                if errs:
+                    return _fmt({"userErrors": errs, "while_creating": v.name})
+                metaobject = result["metaobject"]["id"]
+                created_entries.append(v.name)
+
+            optionValuesToUpdate.append({"id": option_value_id, "linkedMetafieldValue": metaobject})
+
+        link = await _graphql(
+            "mutation linkOpt($productId:ID!,$option:OptionUpdateInput!,$optionValuesToUpdate:[OptionValueUpdateInput!]){"
+            " productOptionUpdate(productId:$productId, option:$option, optionValuesToUpdate:$optionValuesToUpdate){"
+            " userErrors{ field message } } }",
+            {
+                "productId": product_gid,
+                "option": {"id": option["id"], "linkedMetafield": {"namespace": "shopify", "key": "color-pattern"}},
+                "optionValuesToUpdate": optionValuesToUpdate,
+            },
+        )
+        result = link.get("productOptionUpdate", {})
+        errs = result.get("userErrors") or []
+        if errs:
+            return _fmt({"userErrors": errs})
+        return _fmt({"linked": list(value_by_name.keys()), "created_color_entries": created_entries,
+                     "reused_color_entries": reused_entries})
+    except Exception as e:
+        return _error(e)
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # RAW GRAPHQL (read-only escape hatch — added jul 2026, for schema introspection
 # and anything without a dedicated tool yet)
